@@ -21,6 +21,8 @@ import os
 import shutil
 import tempfile
 
+from filelock import FileLock
+
 try:
     from hdfs_io import copy, exists, makedirs  # for internal use only
 except ImportError:
@@ -141,23 +143,28 @@ def verify_copy(src: str, dest: str) -> bool:
 def copy_to_shm(src: str):
     """
     Load the model into   /dev/shm   to make the process of loading the model multiple times more efficient.
+    Uses file locking to prevent race conditions when multiple workers copy simultaneously.
     """
     shm_model_root = "/dev/shm/verl-cache/"
     src_abs = os.path.abspath(os.path.normpath(src))
     dest = os.path.join(shm_model_root, hashlib.md5(src_abs.encode("utf-8")).hexdigest())
     os.makedirs(dest, exist_ok=True)
     dest = os.path.join(dest, os.path.basename(src_abs))
-    if os.path.exists(dest) and verify_copy(src, dest):
-        # inform user and depends on him
-        print(
-            f"[WARNING]: The memory model path {dest} already exists. If it is not you want, please clear it and "
-            f"restart the task."
-        )
-    else:
-        if os.path.isdir(src):
-            shutil.copytree(src, dest, symlinks=False, dirs_exist_ok=True)
+
+    lock_path = dest.rstrip("/") + ".lock"
+    lock = FileLock(lock_path, timeout=600)
+    with lock:
+        if os.path.exists(dest) and verify_copy(src, dest):
+            # inform user and depends on him
+            print(
+                f"[WARNING]: The memory model path {dest} already exists. If it is not you want, please clear it and "
+                f"restart the task."
+            )
         else:
-            shutil.copy2(src, dest)
+            if os.path.isdir(src):
+                shutil.copytree(src, dest, symlinks=False, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dest)
     return dest
 
 

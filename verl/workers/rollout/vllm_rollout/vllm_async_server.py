@@ -54,7 +54,14 @@ from verl.workers.rollout.vllm_rollout.utils import (
     get_vllm_max_lora_rank,
 )
 
-_VLLM_VERSION = version.parse(vllm.__version__)
+# Custom vLLM forks may report dev versions like "0.1.dev13178" while
+# actually implementing APIs from a much newer release (e.g., v0.13.x).
+# Treat any ".dev" version as latest to avoid false-negative feature gates.
+_vllm_version_str = vllm.__version__
+if ".dev" in _vllm_version_str:
+    _VLLM_VERSION = version.parse("0.99.0")
+else:
+    _VLLM_VERSION = version.parse(_vllm_version_str)
 
 if _VLLM_VERSION > version.parse("0.11.0"):
     from vllm.utils.argparse_utils import FlexibleArgumentParser
