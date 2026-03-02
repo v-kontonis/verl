@@ -43,6 +43,30 @@ class NaiveRewardManager(AbstractRewardManager):
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key  # Store the key for accessing the data source
 
+        # Cache block masking token IDs for KV cache simulation
+        self._block_token_ids = self._resolve_block_token_ids()
+
+    def _resolve_block_token_ids(self) -> dict | None:
+        """Resolve block masking special token IDs from the tokenizer.
+
+        Returns dict with block_start, block_end, summary_end IDs if all
+        tokens are found as single IDs (SFT tokenizer), None otherwise.
+        """
+        token_map = {
+            "block_start": "<|block_start|>",
+            "block_end": "<|block_end|>",
+            "summary_end": "<|summary_end|>",
+        }
+        result = {}
+        for key, token_str in token_map.items():
+            token_id = self.tokenizer.convert_tokens_to_ids(token_str)
+            # If the token is unknown (not in vocab), convert_tokens_to_ids
+            # returns the unk_token_id. Skip in that case.
+            if token_id == self.tokenizer.unk_token_id:
+                return None
+            result[key] = token_id
+        return result
+
     def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
         """We will expand this function gradually based on the available datasets"""
 
@@ -73,10 +97,17 @@ class NaiveRewardManager(AbstractRewardManager):
             # decode
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            # Also decode with special tokens preserved for KV cache metric computation
+            response_str_full = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
 
             ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
             data_source = data_item.non_tensor_batch[self.reward_fn_key]
             extra_info = data_item.non_tensor_batch.get("extra_info", {})
+            extra_info["response_str_full"] = response_str_full
+            # Pass token IDs and block token IDs for exact KV cache simulation
+            extra_info["response_token_ids"] = valid_response_ids.tolist()
+            if self._block_token_ids is not None:
+                extra_info["block_token_ids"] = self._block_token_ids
             num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
             rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
             extra_info["num_turns"] = num_turns

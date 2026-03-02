@@ -141,6 +141,10 @@ class HFModelConfig(BaseConfig):
 
     mtp: MtpConfig = field(default_factory=MtpConfig)
 
+    # Block-masked model for sparse attention during training (actor/ref forward passes)
+    block_masked_model_path: Optional[str] = None
+    block_masked_keep_last_n: int = 0
+
     def __post_init__(self):
         import_external_libs(self.external_lib)
 

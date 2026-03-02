@@ -66,6 +66,17 @@ from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+def _numpy_json_default(obj):
+    """JSON serialization fallback for numpy types."""
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
 
@@ -407,7 +418,7 @@ class RayPPOTrainer:
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            lines.append(json.dumps(entry, ensure_ascii=False, default=_numpy_json_default))
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")

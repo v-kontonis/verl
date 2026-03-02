@@ -67,11 +67,21 @@ class Tracking:
 
             import wandb
 
-            settings = None
+            # Build wandb.Settings - must explicitly set base_url since Ray workers
+            # inherit pod env (WANDB_HOST) not shell exports (WANDB_BASE_URL)
+            settings_kwargs = {}
             if config and config["trainer"].get("wandb_proxy", None):
-                settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
+                settings_kwargs["https_proxy"] = config["trainer"]["wandb_proxy"]
+            # Explicitly set base_url from WANDB_BASE_URL or WANDB_HOST
+            wandb_base_url = os.environ.get("WANDB_BASE_URL") or os.environ.get("WANDB_HOST")
+            if wandb_base_url:
+                settings_kwargs["base_url"] = wandb_base_url
+            settings = wandb.Settings(**settings_kwargs) if settings_kwargs else None
+            
             entity = os.environ.get("WANDB_ENTITY", None)
-            wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
+            # Explicitly set id=experiment_name to avoid AMLT's baked-in WANDB_RUN_ID
+            # env var causing all runs to overwrite the same WandB run.
+            wandb.init(project=project_name, name=experiment_name, id=experiment_name, entity=entity, config=config, settings=settings)
             self.logger["wandb"] = wandb
 
         if "trackio" in default_backend:

@@ -365,8 +365,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         override_config_kwargs.update(override_model_config)
         update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
+        import sys as _sys
+        # Write diagnostics to file directly (Ray may swallow stdout)
+        _diag_file = "/data/vkontonis/memento/memento_rl/block_masking_diag.log"
+        with open(_diag_file, "a") as _df:
+            _df.write(f"[DIAG rank={self.rank}] _build_model_optimizer entry, role={role}\n")
+            _df.flush()
+        print(f"[DIAG rank={self.rank}] _build_model_optimizer entry, role={role}", flush=True)
+        _sys.stdout.flush()
+        _sys.stderr.write(f"[DIAG rank={self.rank}] _build_model_optimizer entry, role={role}\n")
+        _sys.stderr.flush()
         if self.rank == 0:
-            print(f"Model config after override: {actor_model_config}")
+            print(f"Model config after override: {actor_model_config}", flush=True)
 
         # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
         init_context = get_init_weight_context_manager(
@@ -401,6 +411,64 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 else:
                     actor_module_class = AutoModel
 
+            # =====================================================================
+            # BLOCK MASKING: Optionally use custom block-masked model class
+            # =====================================================================
+            block_masked_model_path = self.config.model.get("block_masked_model_path", None)
+            with open("/data/vkontonis/memento/memento_rl/block_masking_diag.log", "a") as _df:
+                _df.write(f"[DIAG rank={self.rank}] block_masked_model_path = {block_masked_model_path}\n")
+            print(f"[DIAG rank={self.rank}] block_masked_model_path = {block_masked_model_path}", flush=True)
+            if block_masked_model_path is not None:
+                import importlib.util
+                import sys
+
+                # Import the custom block-masked model module
+                bm_module_path = os.path.join(block_masked_model_path, "model", "qwen3_block_masked.py")
+                if not os.path.exists(bm_module_path):
+                    raise FileNotFoundError(
+                        f"Block-masked model not found at {bm_module_path}. "
+                        f"Expected qwen3_block_masked/model/qwen3_block_masked.py under {block_masked_model_path}"
+                    )
+                spec = importlib.util.spec_from_file_location("qwen3_block_masked_model", bm_module_path)
+                bm_module = importlib.util.module_from_spec(spec)
+                # Also need the config module
+                bm_config_path = os.path.join(block_masked_model_path, "model", "configuration_qwen3.py")
+                spec_cfg = importlib.util.spec_from_file_location("qwen3_block_masked_config", bm_config_path)
+                bm_config_module = importlib.util.module_from_spec(spec_cfg)
+                sys.modules["qwen3_block_masked_config"] = bm_config_module
+                # Patch the relative import in the model module
+                bm_module.Qwen3Config = None  # will be set after loading config module
+                spec_cfg.loader.exec_module(bm_config_module)
+                # Now load the model module with the config available
+                sys.modules[spec.name] = bm_module
+                # Inject config into model module's namespace before exec
+                bm_module.__dict__["configuration_qwen3"] = bm_config_module
+                # Temporarily add parent package for relative imports
+                parent_pkg_name = "qwen3_block_masked.model"
+                parent_init = type(sys)("qwen3_block_masked")
+                parent_init.__path__ = [os.path.join(block_masked_model_path)]
+                parent_init.__package__ = "qwen3_block_masked"
+                model_pkg = type(sys)("qwen3_block_masked.model")
+                model_pkg.__path__ = [os.path.join(block_masked_model_path, "model")]
+                model_pkg.__package__ = "qwen3_block_masked.model"
+                model_pkg.configuration_qwen3 = bm_config_module
+                sys.modules["qwen3_block_masked"] = parent_init
+                sys.modules["qwen3_block_masked.model"] = model_pkg
+                sys.modules["qwen3_block_masked.model.configuration_qwen3"] = bm_config_module
+                # Set the module's package so relative imports work
+                bm_module.__package__ = "qwen3_block_masked.model"
+                spec.loader.exec_module(bm_module)
+
+                actor_module_class = bm_module.Qwen3ForCausalLM
+                print(f"[BlockMasking] ========================================", flush=True)
+                print(f"[BlockMasking] CUSTOM BLOCK-MASKED MODEL ENABLED (rank={self.rank})", flush=True)
+                print(f"[BlockMasking] Module path: {bm_module_path}", flush=True)
+                print(f"[BlockMasking] Class: {actor_module_class}", flush=True)
+                print(f"[BlockMasking] Class module: {actor_module_class.__module__}", flush=True)
+                print(f"[BlockMasking] Has _apply_block_masking: {hasattr(actor_module_class, '_apply_block_masking') or any(hasattr(getattr(actor_module_class, a, None), '_apply_block_masking') for a in ['model'] if hasattr(actor_module_class, a))}", flush=True)
+                print(f"[BlockMasking] ========================================", flush=True)
+            # =====================================================================
+
             actor_module = actor_module_class.from_pretrained(
                 pretrained_model_name_or_path=local_path,
                 torch_dtype=torch_dtype,
@@ -408,6 +476,46 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 trust_remote_code=trust_remote_code,
                 attn_implementation=attn_implementation,
             )
+
+            # =====================================================================
+            # BLOCK MASKING: Set special token IDs on the model after loading
+            # =====================================================================
+            if block_masked_model_path is not None and hasattr(actor_module, "model") and hasattr(actor_module.model, "block_start_id"):
+                _bm_token_map = {
+                    "block_start_id": "<|block_start|>",
+                    "block_end_id": "<|block_end|>",
+                    "summary_start_id": "<|summary_start|>",
+                    "summary_end_id": "<|summary_end|>",
+                    "reasoning_start_id": "<think>",
+                    "reasoning_end_id": "</think>",
+                    "im_start_id": "<|im_start|>",
+                }
+                for attr, token_str in _bm_token_map.items():
+                    tok_id = self.tokenizer.convert_tokens_to_ids(token_str)
+                    if tok_id != self.tokenizer.unk_token_id:
+                        setattr(actor_module.model, attr, tok_id)
+
+                # Set "assistant" token ID (single token, not special)
+                assistant_ids = self.tokenizer.encode("assistant", add_special_tokens=False)
+                if len(assistant_ids) == 1:
+                    actor_module.model.assistant_token_id = assistant_ids[0]
+
+                # Set keep_last_n_blocks from config
+                keep_n = self.config.model.get("block_masked_keep_last_n", 0)
+                actor_module.model.set_keep_last_n_blocks(keep_n)
+
+                print(f"[BlockMasking] Token IDs set on model (rank={self.rank}):", flush=True)
+                for attr, token_str in _bm_token_map.items():
+                    print(f"  {token_str}: {getattr(actor_module.model, attr, None)}", flush=True)
+                print(f"  assistant: {actor_module.model.assistant_token_id}", flush=True)
+                print(f"  keep_last_n_blocks: {keep_n}", flush=True)
+                # Verify the actual model class loaded is our custom one, not HF standard
+                print(f"[BlockMasking] actor_module type: {type(actor_module)}", flush=True)
+                print(f"[BlockMasking] actor_module.model type: {type(actor_module.model)}", flush=True)
+                print(f"[BlockMasking] Has _update_block_cache: {hasattr(actor_module.model, '_update_block_cache')}", flush=True)
+                print(f"[BlockMasking] Has _apply_block_masking: {hasattr(actor_module.model, '_apply_block_masking')}", flush=True)
+                print(f"[BlockMasking] VERIFICATION PASSED: Custom block-masked model is active", flush=True)
+            # =====================================================================
 
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:

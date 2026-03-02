@@ -31,6 +31,30 @@ class NaiveRewardManager(RewardManagerBase):
         self.reward_router_address = reward_router_address
         self.reward_model_tokenizer = reward_model_tokenizer
 
+        # Cache block masking token IDs for KV cache simulation
+        self._block_token_ids = self._resolve_block_token_ids()
+
+    def _resolve_block_token_ids(self) -> dict | None:
+        """Resolve block masking special token IDs from the tokenizer.
+
+        Returns dict with block_start, block_end, summary_end IDs if all
+        tokens are found as single IDs (SFT tokenizer), None otherwise.
+        """
+        token_map = {
+            "block_start": "<|block_start|>",
+            "block_end": "<|block_end|>",
+            "summary_end": "<|summary_end|>",
+        }
+        result = {}
+        for key, token_str in token_map.items():
+            token_id = self.tokenizer.convert_tokens_to_ids(token_str)
+            # If the token is unknown (not in vocab), convert_tokens_to_ids
+            # returns the unk_token_id. Skip in that case.
+            if token_id == self.tokenizer.unk_token_id:
+                return None
+            result[key] = token_id
+        return result
+
     async def run_single(self, data: DataProto) -> dict:
         assert len(data) == 1, "Only support single data item"
         data_item = data[0]
@@ -51,9 +75,19 @@ class NaiveRewardManager(RewardManagerBase):
         extra_info["num_turns"] = num_turns
         extra_info["rollout_reward_scores"] = rollout_reward_scores
 
+        # Pass token IDs and block token IDs for exact KV cache simulation
+        extra_info["response_token_ids"] = valid_response_ids.tolist()
+        if self._block_token_ids is not None:
+            extra_info["block_token_ids"] = self._block_token_ids
+
         response_str = await self.loop.run_in_executor(
             None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
         )
+        # Also decode with special tokens preserved for KV cache metric computation
+        response_str_full = await self.loop.run_in_executor(
+            None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
+        )
+        extra_info["response_str_full"] = response_str_full
 
         extra_reward_kwargs = (
             {
